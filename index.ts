@@ -18,7 +18,9 @@ export type LedgerEntryType =
   | "REFUND_UNUSED"
   | "OVERAGE_DEDUCT"
   | "RELEASE"
-  | "EXPIRE";
+  | "EXPIRE"
+  /** Credits left in a bucket when it expired (or returned to it after). */
+  | "CREDIT_EXPIRE";
 
 export type ReservationStatus = "PENDING" | "COMMITTED" | "RELEASED" | "EXPIRED";
 
@@ -54,6 +56,13 @@ export interface GrantParams {
   amount: number;
   reason?: string;
   metadata?: Metadata;
+  /**
+   * Make these credits expire (e.g. the end of the billing period for a
+   * monthly allowance). Expiring credits are spent before permanent ones,
+   * soonest expiry first; whatever is left at `expiresAt` is removed.
+   * Omit for credits that never expire, such as purchased top-ups.
+   */
+  expiresAt?: Date | string;
 }
 
 export interface ReserveParams {
@@ -86,9 +95,14 @@ export interface GrantResult {
   tenantId: string;
   availableCredits: number;
   reservedCredits: number;
+  /** The part of `availableCredits` that will expire. */
+  expiringCredits: number;
   grantedCredits: number;
   ledgerEntryId: string;
   updatedAt: string;
+  /** Set when the grant had `expiresAt`. */
+  bucketId?: string;
+  expiresAt?: string;
 }
 
 export interface ReserveAllowed {
@@ -115,22 +129,30 @@ export interface CommitResult {
   committedAmount: number;
   refundedCredits: number;
   overageCredits: number;
+  /** Unused credits whose bucket expired while they were held. */
+  expiredCredits: number;
   availableCredits: number;
   reservedCredits: number;
+  expiringCredits: number;
 }
 
 export interface ReleaseResult {
   reservationId: string;
   status: "RELEASED";
   releasedCredits: number;
+  /** Released credits whose bucket expired while they were held. */
+  expiredCredits: number;
   availableCredits: number;
   reservedCredits: number;
+  expiringCredits: number;
 }
 
 export interface LedgerEntry {
   id: string;
   tenantId: string;
   reservationId: string | null;
+  /** The credit bucket a GRANT created or a CREDIT_EXPIRE emptied. */
+  bucketId: string | null;
   entryType: LedgerEntryType;
   deltaAvailable: number;
   deltaReserved: number;
@@ -140,10 +162,28 @@ export interface LedgerEntry {
   createdAt: string;
 }
 
+/** Credits from one grant with an expiry. */
+export interface CreditBucket {
+  id: string;
+  granted: number;
+  remaining: number;
+  expiresAt: string;
+  reason: string | null;
+  createdAt: string;
+}
+
 export interface Wallet {
   tenantId: string;
+  /** Everything spendable: permanent + expiring. */
   availableCredits: number;
   reservedCredits: number;
+  /** Spendable credits that will expire (sum of `creditBuckets`). */
+  expiringCredits: number;
+  /** Credits that never expire. */
+  permanentCredits: number;
+  nextExpiryAt: string | null;
+  /** Buckets with credits left, soonest expiry first. */
+  creditBuckets: CreditBucket[];
   updatedAt: string;
   recentLedger: LedgerEntry[];
 }
@@ -262,20 +302,31 @@ export class VaultClient {
     this.#retryDelayMs = options.retryDelayMs ?? 200;
   }
 
-  /** Add credits to a tenant's wallet (creates the wallet if needed). */
+  /**
+   * Add credits to a tenant's wallet (creates the wallet if needed). Pass
+   * `expiresAt` for credits that lapse, such as a monthly allowance.
+   */
   async grant(params: GrantParams, options: RequestOptions = {}): Promise<GrantResult> {
     const { body } = await this.#post(
       "/v1/credits/grant",
-      { tenant_id: params.tenantId, amount: params.amount, reason: params.reason, metadata: params.metadata },
+      {
+        tenant_id: params.tenantId,
+        amount: params.amount,
+        reason: params.reason,
+        metadata: params.metadata,
+        expires_at: params.expiresAt instanceof Date ? params.expiresAt.toISOString() : params.expiresAt,
+      },
       options,
     );
     return {
       tenantId: str(body.tenant_id),
       availableCredits: num(body.available_credits),
       reservedCredits: num(body.reserved_credits),
+      expiringCredits: num(body.expiring_credits),
       grantedCredits: num(body.granted_credits),
       ledgerEntryId: str(body.ledger_entry_id),
       updatedAt: str(body.updated_at),
+      ...(typeof body.bucket_id === "string" ? { bucketId: body.bucket_id, expiresAt: str(body.expires_at) } : {}),
     };
   }
 
@@ -336,8 +387,10 @@ export class VaultClient {
       committedAmount: num(body.committed_amount),
       refundedCredits: num(body.refunded_credits),
       overageCredits: num(body.overage_credits),
+      expiredCredits: num(body.expired_credits ?? 0),
       availableCredits: num(body.available_credits),
       reservedCredits: num(body.reserved_credits),
+      expiringCredits: num(body.expiring_credits ?? 0),
     };
   }
 
@@ -352,8 +405,10 @@ export class VaultClient {
       reservationId: str(body.reservation_id),
       status: "RELEASED",
       releasedCredits: num(body.released_credits),
+      expiredCredits: num(body.expired_credits ?? 0),
       availableCredits: num(body.available_credits),
       reservedCredits: num(body.reserved_credits),
+      expiringCredits: num(body.expiring_credits ?? 0),
     };
   }
 
@@ -368,10 +423,15 @@ export class VaultClient {
       [],
     );
     const ledger = Array.isArray(body.recent_ledger) ? body.recent_ledger : [];
+    const buckets = Array.isArray(body.credit_buckets) ? body.credit_buckets : [];
     return {
       tenantId: str(body.tenant_id),
       availableCredits: num(body.available_credits),
       reservedCredits: num(body.reserved_credits),
+      expiringCredits: num(body.expiring_credits ?? 0),
+      permanentCredits: num(body.permanent_credits ?? body.available_credits),
+      nextExpiryAt: typeof body.next_expiry_at === "string" ? body.next_expiry_at : null,
+      creditBuckets: buckets.filter(isRecord).map(toCreditBucket),
       updatedAt: str(body.updated_at),
       recentLedger: ledger.filter(isRecord).map(toLedgerEntry),
     };
@@ -596,12 +656,24 @@ function toLedgerEntry(raw: Json): LedgerEntry {
     id: str(raw.id),
     tenantId: str(raw.tenant_id),
     reservationId: typeof raw.reservation_id === "string" ? raw.reservation_id : null,
+    bucketId: typeof raw.bucket_id === "string" ? raw.bucket_id : null,
     entryType: str(raw.entry_type) as LedgerEntryType,
     deltaAvailable: num(raw.delta_available),
     deltaReserved: num(raw.delta_reserved),
     balanceAvailableAfter: num(raw.balance_available_after),
     balanceReservedAfter: num(raw.balance_reserved_after),
     metadata: isRecord(raw.metadata) ? raw.metadata : {},
+    createdAt: str(raw.created_at),
+  };
+}
+
+function toCreditBucket(raw: Json): CreditBucket {
+  return {
+    id: str(raw.id),
+    granted: num(raw.granted),
+    remaining: num(raw.remaining),
+    expiresAt: str(raw.expires_at),
+    reason: typeof raw.reason === "string" ? raw.reason : null,
     createdAt: str(raw.created_at),
   };
 }
