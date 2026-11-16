@@ -220,13 +220,48 @@ export interface CreditHoldResult<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Rate limits
+// ---------------------------------------------------------------------------
+
+/**
+ * Where your account stands against its hourly request limit (free plan:
+ * 120/hour). The first time the account goes over it, a one-time 24-hour
+ * grace period starts with a higher limit (600/hour) so you have time to
+ * upgrade; after that, requests over the limit fail with
+ * `hourly_limit_exceeded` until the next hour.
+ */
+export interface RateLimitInfo {
+  /** Requests allowed this hour (the grace limit while the grace period runs). */
+  limit: number;
+  remaining: number;
+  /** When this hour's count resets. */
+  resetAt: Date;
+  /** Set while the grace period runs: upgrade before then. */
+  graceEndsAt?: Date;
+}
+
+function parseRateLimit(headers: Headers): RateLimitInfo | undefined {
+  const limit = headers.get("x-ratelimit-limit");
+  const remaining = headers.get("x-ratelimit-remaining");
+  const reset = headers.get("x-ratelimit-reset");
+  if (limit === null || remaining === null || reset === null) return undefined;
+  const graceEnds = headers.get("x-ratelimit-grace-ends");
+  return {
+    limit: Number(limit),
+    remaining: Number(remaining),
+    resetAt: new Date(Number(reset) * 1000),
+    ...(graceEnds !== null ? { graceEndsAt: new Date(Number(graceEnds) * 1000) } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 /**
  * The API answered with an error status. Notable codes: `invalid_api_key`
  * (401), `account_suspended` / `trial_expired` / `tenant_limit_reached` (403),
- * `rate_limited` / `monthly_quota_exceeded` (429).
+ * `rate_limited` / `hourly_limit_exceeded` / `monthly_quota_exceeded` (429).
  */
 export class VaultApiError extends Error {
   readonly status: number;
@@ -234,8 +269,10 @@ export class VaultApiError extends Error {
   readonly body: unknown;
   /** From the `Retry-After` header on 429 responses. */
   readonly retryAfterSeconds: number | undefined;
+  /** The account's hourly limit, if it has one. */
+  readonly rateLimit: RateLimitInfo | undefined;
 
-  constructor(status: number, body: unknown, retryAfterSeconds?: number) {
+  constructor(status: number, body: unknown, retryAfterSeconds?: number, rateLimit?: RateLimitInfo) {
     const record = isRecord(body) ? body : {};
     const code = typeof record.error === "string" ? record.error : `http_${status}`;
     const detail = typeof record.message === "string" ? `: ${record.message}` : "";
@@ -245,6 +282,7 @@ export class VaultApiError extends Error {
     this.code = code;
     this.body = body;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.rateLimit = rateLimit;
   }
 }
 
@@ -286,6 +324,7 @@ export class VaultClient {
   readonly #timeoutMs: number;
   readonly #maxRetries: number;
   readonly #retryDelayMs: number;
+  #rateLimit: RateLimitInfo | undefined;
 
   constructor(options: VaultClientOptions) {
     if (!options.baseUrl) throw new TypeError("VaultClient: baseUrl is required");
@@ -516,6 +555,15 @@ export class VaultClient {
     };
   }
 
+  /**
+   * The hourly limit as of the most recent response, or `undefined` if the
+   * account has no hourly limit (or no request has completed yet). Check
+   * `graceEndsAt` to warn before the grace period runs out.
+   */
+  get rateLimit(): RateLimitInfo | undefined {
+    return this.#rateLimit;
+  }
+
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
@@ -583,6 +631,8 @@ export class VaultClient {
         continue;
       }
 
+      const rateLimit = parseRateLimit(response.headers);
+      this.#rateLimit = rateLimit;
       const text = await response.text();
       let parsed: unknown = {};
       if (text) {
@@ -597,13 +647,13 @@ export class VaultClient {
         return { status: response.status, body: json };
       }
       const retryAfter = Number(response.headers.get("retry-after")) || undefined;
-      // Per-second rate limits clear quickly; monthly quotas do not.
+      // Per-second rate limits clear quickly; hourly and monthly limits do not.
       if (response.status === 429 && json.error === "rate_limited" && attempt < this.#maxRetries) {
         await this.#sleep(Math.min((retryAfter ?? 1) * 1000, 30_000), signal);
         continue;
       }
       if (response.status === 402) throw new InsufficientCreditsError(json);
-      throw new VaultApiError(response.status, json, retryAfter);
+      throw new VaultApiError(response.status, json, retryAfter, rateLimit);
     }
   }
 
