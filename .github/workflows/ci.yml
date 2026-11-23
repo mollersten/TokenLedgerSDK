@@ -1,0 +1,48 @@
+name: CI
+
+# Typechecks the SDK on every push and pull request.
+#
+# Typecheck only. The end-to-end checks in test/*.e2e.ts need a running
+# TokenLedger server and an API key, so they are deliberately not run in CI
+# yet. CI has no secrets.
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref cancels the run that is still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # package.json has no devDependencies, so tsc comes from here. Matches the
+  # version used locally. tsconfig.json needs 5.8 or newer (erasableSyntaxOnly).
+  # Once typescript is a devDependency with a lockfile, drop this and run
+  # `npm ci && npm run typecheck` instead.
+  TYPESCRIPT_VERSION: "7.0.2"
+
+jobs:
+  typecheck:
+    name: typecheck (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines.node is ">=20": check the oldest supported and the newest.
+        node: ["20", "latest"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Typecheck
+        run: npx --yes --package "typescript@$TYPESCRIPT_VERSION" -- tsc -p tsconfig.json --noEmit
