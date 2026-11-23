@@ -2,11 +2,15 @@
  * TokenLedger TypeScript SDK.
  *
  * Zero runtime dependencies: uses the platform's `fetch`, `AbortController`
- * and `crypto.randomUUID` (Node 19+, Deno, Bun, modern browsers).
+ * and `crypto.randomUUID` (Node 20+, Deno, Bun, modern browsers).
  *
  * Every mutating call sends an `Idempotency-Key`. Network failures and 5xx
  * responses are retried with the *same* key, so a retry can never charge a
  * tenant twice: the server replays the original response instead.
+ *
+ * That covers retries inside one call. To charge for a *thing* once, even
+ * when the tenant's code crashes after getting it and asks again from a new
+ * process, use `chargeOnce` with an `itemKey`.
  */
 
 export type Metadata = Record<string, unknown>;
@@ -28,7 +32,7 @@ export type ReservationStatus = "PENDING" | "COMMITTED" | "RELEASED" | "EXPIRED"
 // Options & params
 // ---------------------------------------------------------------------------
 
-export interface VaultClientOptions {
+export interface TokenLedgerClientOptions {
   /** API base URL, e.g. `https://api.tokenledger.example`. */
   baseUrl: string;
   /** Secret API key (`tl_live_…`). Keep it server-side; never ship it to browsers. */
@@ -46,7 +50,13 @@ export interface VaultClientOptions {
 }
 
 export interface RequestOptions {
-  /** Supply your own key to make a call idempotent across process restarts. */
+  /**
+   * Supply your own key to make a call idempotent across process restarts.
+   * A key replays the first answer it got, including refusals: a reserve
+   * that got `insufficient_credits` answers the same with that key even
+   * after a top-up. Use a new key for a new attempt. Keys are remembered for
+   * 24 hours; `chargeOnce` doesn't rely on them (an owned item stays owned).
+   */
   idempotencyKey?: string;
   signal?: AbortSignal;
 }
@@ -158,7 +168,16 @@ export interface LedgerEntry {
   deltaReserved: number;
   balanceAvailableAfter: number;
   balanceReservedAfter: number;
+  /**
+   * What this event recorded beyond the amounts: a grant's reason, a
+   * commit's metadata, who expired it. (Entries written before the ledger
+   * was normalized may also carry `feature` and `buckets` here.)
+   */
   metadata: Metadata;
+  /** The feature of the reservation this entry belongs to, if any. */
+  feature: string | null;
+  /** The expiring-credit buckets the credits moved from or to. */
+  buckets: { bucketId: string; amount: number }[];
   createdAt: string;
 }
 
@@ -214,9 +233,195 @@ export type HoldOutcome<T> = number | { cost: number; result?: T; metadata?: Met
 
 export interface CreditHoldResult<T> {
   result: T | undefined;
+  /** What the callback reported using. */
   cost: number;
+  /**
+   * Usage that could not be charged: the cost went over the hold and the
+   * tenant's balance could not cover the difference, so only the hold was
+   * charged. 0 normally.
+   */
+  uncoveredCredits: number;
   reservation: ReserveAllowed;
   commit: CommitResult;
+}
+
+// ---------------------------------------------------------------------------
+// chargeOnce
+// ---------------------------------------------------------------------------
+
+export interface ChargeOnceOptions {
+  tenantId: string;
+  /**
+   * Names exactly one thing the tenant buys, e.g. `email:${personId}`.
+   * Together with `feature` it is the item: the same key under another
+   * feature is a different item, bought separately. Once paid, the tenant
+   * owns it (for good, or for the account's `itemRetentionDays`); it never
+   * unlocks anything for another tenant. Make it as narrow as what you
+   * deliver (a key per company would sell every person there for the price
+   * of one), and add a version if the item can change and should be paid for
+   * again (`report:${id}:v2`).
+   */
+  itemKey: string;
+  feature: string;
+  /** What the item costs. Charged in full once it is delivered. */
+  credits: number;
+  /**
+   * How long the hold lives while `callback` runs. Default 60. Keep it
+   * short: if your process dies mid-callback, the item can't be charged
+   * again until the hold runs out.
+   */
+  ttlSeconds?: number;
+  metadata?: Metadata;
+  /** How long to wait while another request is charging the same item. Default 10 000 ms. */
+  waitMs?: number;
+  /** Reason recorded when the hold is released because the callback threw. */
+  releaseReason?: string;
+}
+
+export interface ChargeOnceItem {
+  tenantId: string;
+  itemKey: string;
+  feature: string;
+  /**
+   * The tenant has paid for this item before. Deliver it again without
+   * charging (from your cache, if you keep one).
+   */
+  alreadyCharged: boolean;
+  /**
+   * The new hold, or the earlier reservation that paid for the item (`null`
+   * when the purchase was imported from another system).
+   */
+  reservationId: string | null;
+  /** Aborted when the hold's TTL elapses; pass it to your upstream calls. */
+  signal: AbortSignal;
+}
+
+/** Returned from a `chargeOnce` callback via `noCharge()`: deliver, but don't bill. */
+export class NoCharge<T> {
+  readonly result: T;
+
+  constructor(result: T) {
+    this.result = result;
+  }
+}
+
+/**
+ * Return `noCharge(result)` from a `chargeOnce` callback when there is
+ * nothing to bill for, e.g. a lookup that found nothing. The hold is
+ * released, nothing is charged, and the item stays unpaid, so it is charged
+ * the next time it is actually delivered.
+ */
+export function noCharge<T>(result: T): NoCharge<T> {
+  return new NoCharge(result);
+}
+
+export interface ChargeOnceResult<T> {
+  result: T;
+  /** This call charged the tenant `creditsCharged` credits. */
+  charged: boolean;
+  /** The tenant had already paid for the item; nothing was charged now. */
+  alreadyCharged: boolean;
+  creditsCharged: number;
+  /** `null` when the item was owned through an imported purchase. */
+  reservationId: string | null;
+  /** Set when this call charged. */
+  commit?: CommitResult;
+}
+
+// ---------------------------------------------------------------------------
+// importTenants (optional: moving customers over from another system)
+// ---------------------------------------------------------------------------
+
+/** Part of a customer's starting balance. */
+export interface ImportCredit {
+  amount: number;
+  /** For credits that lapse (a monthly allowance). Must be in the future. */
+  expiresAt?: Date | string;
+  reason?: string;
+}
+
+/** Something the customer bought in the old system. `chargeOnce` treats it as paid. */
+export interface ImportPurchase {
+  itemKey: string;
+  /**
+   * The feature `chargeOnce` will use for this item. It is part of the item:
+   * under a different feature the same key is a different item, not covered
+   * by this purchase.
+   */
+  feature: string;
+  /** What they paid for it (at least 1). */
+  credits: number;
+  purchasedAt?: Date | string;
+}
+
+export interface ImportTenant {
+  tenantId: string;
+  /** Their balance in the old system. A tenant's balance can be imported once. */
+  credits?: ImportCredit[];
+  /**
+   * What they already bought. Leave it out if `chargeOnce` should charge
+   * for those items again; it can also be imported later on its own.
+   */
+  purchases?: ImportPurchase[];
+}
+
+export interface ImportOptions {
+  /**
+   * Names this import, e.g. `"from-stripe-2026-11"`. Run it again with the
+   * same id and the same data (after a crash, say) and every customer already
+   * imported is skipped. Use a new id for a later, different import.
+   */
+  importId: string;
+  /** Called after each request, e.g. to log progress. */
+  onProgress?: (progress: { tenantsDone: number; tenantsTotal: number }) => void;
+  signal?: AbortSignal;
+}
+
+export interface ImportTenantResult {
+  tenantId: string;
+  /** `replayed`: imported by an earlier run with the same `importId`. */
+  status: "imported" | "replayed" | "failed";
+  grantedCredits: number;
+  purchasesImported: number;
+  /** Items the tenant had already paid for. */
+  purchasesSkipped: number;
+  skippedItemKeys: string[];
+  /** The balance right after the import (a replay shows it as of then). */
+  availableCredits?: number;
+  /**
+   * Set when `status` is `failed`, e.g. `credits_already_imported`,
+   * `tenant_limit_reached`, `invalid_import`, or `item_charge_in_progress`
+   * (one of its items was being charged; rerun once it settles).
+   */
+  error?: string;
+  message?: string;
+}
+
+export interface ImportResult {
+  imported: number;
+  replayed: number;
+  failed: number;
+  /** One per tenant, in the order given. */
+  tenants: ImportTenantResult[];
+}
+
+/** Server limits per import request; `importTenants` splits to stay under them. */
+const IMPORT_TENANTS_PER_CALL = 100;
+const IMPORT_PURCHASES_PER_CALL = 5_000;
+
+// ---------------------------------------------------------------------------
+// Account settings
+// ---------------------------------------------------------------------------
+
+export interface AccountSettings {
+  /**
+   * How many days a tenant owns an item it bought through `chargeOnce` (or
+   * that was imported). After that the item is charged again the next time.
+   * The record is deleted 7 days later, so a value set by mistake can be
+   * raised (or cleared) in that time and the items are owned again.
+   * `null`: owned for good (the default).
+   */
+  itemRetentionDays: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,9 +466,11 @@ function parseRateLimit(headers: Headers): RateLimitInfo | undefined {
 /**
  * The API answered with an error status. Notable codes: `invalid_api_key`
  * (401), `account_suspended` / `trial_expired` / `tenant_limit_reached` (403),
+ * `item_charge_in_progress` / `import_in_progress` (409), `wallet_busy` /
+ * `service_busy` (503, retried automatically),
  * `rate_limited` / `hourly_limit_exceeded` / `monthly_quota_exceeded` (429).
  */
-export class VaultApiError extends Error {
+export class TokenLedgerApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly body: unknown;
@@ -277,7 +484,7 @@ export class VaultApiError extends Error {
     const code = typeof record.error === "string" ? record.error : `http_${status}`;
     const detail = typeof record.message === "string" ? `: ${record.message}` : "";
     super(`TokenLedger API ${status} ${code}${detail}`);
-    this.name = "VaultApiError";
+    this.name = "TokenLedgerApiError";
     this.status = status;
     this.code = code;
     this.body = body;
@@ -287,7 +494,7 @@ export class VaultApiError extends Error {
 }
 
 /** The tenant cannot cover the requested credits (HTTP 402). */
-export class InsufficientCreditsError extends VaultApiError {
+export class InsufficientCreditsError extends TokenLedgerApiError {
   readonly availableCredits: number;
 
   constructor(body: unknown) {
@@ -299,10 +506,10 @@ export class InsufficientCreditsError extends VaultApiError {
 }
 
 /** The request never produced an HTTP response (after all retries). */
-export class VaultNetworkError extends Error {
+export class TokenLedgerNetworkError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
-    this.name = "VaultNetworkError";
+    this.name = "TokenLedgerNetworkError";
   }
 }
 
@@ -317,7 +524,7 @@ interface RawResponse {
   body: Json;
 }
 
-export class VaultClient {
+export class TokenLedgerClient {
   readonly #baseUrl: string;
   readonly #headers: Record<string, string>;
   readonly #fetch: typeof fetch;
@@ -326,12 +533,12 @@ export class VaultClient {
   readonly #retryDelayMs: number;
   #rateLimit: RateLimitInfo | undefined;
 
-  constructor(options: VaultClientOptions) {
-    if (!options.baseUrl) throw new TypeError("VaultClient: baseUrl is required");
-    if (!options.apiKey) throw new TypeError("VaultClient: apiKey is required");
+  constructor(options: TokenLedgerClientOptions) {
+    if (!options.baseUrl) throw new TypeError("TokenLedgerClient: baseUrl is required");
+    if (!options.apiKey) throw new TypeError("TokenLedgerClient: apiKey is required");
     const fetchImpl = options.fetch ?? globalThis.fetch;
     if (typeof fetchImpl !== "function") {
-      throw new TypeError("VaultClient: no fetch implementation available; pass options.fetch");
+      throw new TypeError("TokenLedgerClient: no fetch implementation available; pass options.fetch");
     }
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.#headers = { ...options.headers, authorization: `Bearer ${options.apiKey}` };
@@ -483,6 +690,11 @@ export class VaultClient {
    * If the process dies mid-callback, the server's TTL reaper returns the hold
    * after `ttlSeconds`, so credits are never stranded.
    *
+   * If the cost goes over the hold and the balance cannot cover the rest, the
+   * hold itself is charged and the shortfall is in `uncoveredCredits`. If the
+   * callback outlives `ttlSeconds`, the hold is gone and the commit throws
+   * (`reservation_not_pending`): nothing was charged, so don't deliver.
+   *
    * @throws InsufficientCreditsError when the reservation is denied.
    */
   async withCreditHold<T = undefined>(
@@ -504,13 +716,7 @@ export class VaultClient {
 
     const { reservationId } = reservation;
     const expiresAt = new Date(reservation.expiresAt);
-    const expiry = new AbortController();
-    // Not unref'd on purpose: it only lives while the callback runs, and a
-    // callback that is just waiting on `hold.signal` must still see the abort.
-    const timer = setTimeout(
-      () => expiry.abort(new Error(`credit hold ${reservationId} expired`)),
-      Math.max(0, expiresAt.getTime() - Date.now()),
-    );
+    const expiry = holdExpiry(reservationId, expiresAt);
 
     let outcome: HoldOutcome<T>;
     try {
@@ -523,11 +729,11 @@ export class VaultClient {
         signal: expiry.signal,
       });
     } catch (error) {
-      clearTimeout(timer);
+      expiry.clear();
       await this.#releaseQuietly(options.tenantId, reservationId, releaseReason ?? errorReason(error));
       throw error;
     }
-    clearTimeout(timer);
+    expiry.clear();
 
     const normalized = typeof outcome === "number" ? { cost: outcome } : outcome;
     const cost = normalized?.cost;
@@ -538,21 +744,268 @@ export class VaultClient {
       );
     }
 
-    const commit = await this.commit(
-      {
-        tenantId: options.tenantId,
-        reservationId,
-        actualCreditsUsed: cost,
-        metadata: typeof outcome === "number" ? undefined : outcome.metadata,
-      },
-      { idempotencyKey: `${reservationId}:commit` },
-    );
+    const metadata = typeof outcome === "number" ? undefined : outcome.metadata;
+    let commit: CommitResult;
+    let uncoveredCredits = 0;
+    try {
+      commit = await this.commit(
+        { tenantId: options.tenantId, reservationId, actualCreditsUsed: cost, metadata },
+        { idempotencyKey: `${reservationId}:commit` },
+      );
+    } catch (error) {
+      // The work is done but the balance cannot cover what it used beyond
+      // the hold. Charging nothing would hand it out free, so charge the
+      // hold (always covered) and report the rest.
+      if (!(error instanceof InsufficientCreditsError) || cost <= options.estimateCredits) throw error;
+      commit = await this.commit(
+        { tenantId: options.tenantId, reservationId, actualCreditsUsed: options.estimateCredits, metadata },
+        { idempotencyKey: `${reservationId}:commit-held` },
+      );
+      uncoveredCredits = cost - options.estimateCredits;
+    }
     return {
       result: typeof outcome === "number" ? undefined : outcome.result,
       cost,
+      uncoveredCredits,
       reservation,
       commit,
     };
+  }
+
+  /**
+   * Charge a tenant for one item once, however many times it is asked for:
+   * reserve `credits`, run `callback` to produce the item, then commit. If
+   * the tenant has paid for `itemKey` before, `callback` runs with
+   * `alreadyCharged: true` and nothing is charged, so a customer whose own
+   * code crashed after getting the item can fetch it again for free.
+   *
+   * None of this lets an end user get an item without paying:
+   * - It counts as paid only once the commit succeeds. If `callback` throws,
+   *   returns `noCharge(...)`, or outlives the hold's TTL, nothing is paid and
+   *   the next request charges again.
+   * - Requests racing for the same item cannot all get it free or all pay:
+   *   one holds the charge and the others wait for it (up to `waitMs`), then
+   *   get the item as already paid, or charge it themselves if that attempt
+   *   failed. After `waitMs` this throws `TokenLedgerApiError` with code
+   *   `item_charge_in_progress`.
+   * - Owned items are per tenant. An item is (feature, itemKey): the same key
+   *   under another feature is a different item and is charged separately.
+   *
+   * Owned items last forever unless the account sets `itemRetentionDays`
+   * (see `updateSettings`); after that many days the item is charged again.
+   *
+   * Hand the result to your user only after this resolves, not from inside
+   * `callback`: if the commit fails, this throws and nothing was paid.
+   *
+   * Items bought before you moved to TokenLedger are charged again, unless
+   * you import them with `importTenants` (optional).
+   *
+   * @throws InsufficientCreditsError when the tenant cannot cover `credits`.
+   */
+  async chargeOnce<T>(
+    options: ChargeOnceOptions,
+    callback: (item: ChargeOnceItem) => Promise<T | NoCharge<T>> | T | NoCharge<T>,
+  ): Promise<ChargeOnceResult<T>> {
+    const { tenantId, itemKey, feature, credits } = options;
+    if (!Number.isSafeInteger(credits) || credits <= 0) {
+      throw new TypeError(`chargeOnce: credits must be a positive integer, got ${String(credits)}`);
+    }
+    const reservation = await this.#reserveItem(options);
+    const { reservationId } = reservation;
+
+    if (reservation.alreadyCharged) {
+      const outcome = await callback({
+        tenantId,
+        itemKey,
+        feature,
+        alreadyCharged: true,
+        reservationId,
+        signal: new AbortController().signal,
+      });
+      return {
+        result: outcome instanceof NoCharge ? outcome.result : outcome,
+        charged: false,
+        alreadyCharged: true,
+        creditsCharged: 0,
+        reservationId,
+      };
+    }
+
+    if (reservationId === null) throw new TokenLedgerApiError(200, { error: "unexpected_response", message: "no reservation id for a new hold" });
+    const expiry = holdExpiry(reservationId, new Date(reservation.expiresAt));
+    let outcome: T | NoCharge<T>;
+    try {
+      outcome = await callback({ tenantId, itemKey, feature, alreadyCharged: false, reservationId, signal: expiry.signal });
+    } catch (error) {
+      expiry.clear();
+      await this.#releaseQuietly(tenantId, reservationId, options.releaseReason ?? errorReason(error));
+      throw error;
+    }
+    expiry.clear();
+
+    if (outcome instanceof NoCharge) {
+      await this.#releaseQuietly(tenantId, reservationId, "not_charged");
+      return { result: outcome.result, charged: false, alreadyCharged: false, creditsCharged: 0, reservationId };
+    }
+    const commit = await this.commit(
+      { tenantId, reservationId, actualCreditsUsed: credits },
+      { idempotencyKey: `${reservationId}:commit` },
+    );
+    return { result: outcome, charged: true, alreadyCharged: false, creditsCharged: credits, reservationId, commit };
+  }
+
+  /**
+   * Optional: move customers over from another billing system. Nothing else
+   * in the SDK needs it; `chargeOnce` works the same with or without an
+   * import. Per customer, import their balance, what they already bought, or
+   * both.
+   *
+   * Any number of customers can be passed. They are sent 100 per request
+   * (and at most 5 000 purchases per request; a customer with more is spread
+   * over follow-up requests). Imports do not count toward the account's
+   * request limits.
+   *
+   * Safe to rerun, at any time: with the same `importId` and data, customers
+   * already imported are skipped (`replayed`), so a crash halfway costs
+   * nothing.
+   * A customer whose data changed since is refused (`idempotency_key_mismatch`)
+   * rather than imported twice. Customers that fail are reported, not thrown,
+   * and do not stop the rest; fix them and rerun with the same `importId`.
+   *
+   * Switch a customer over only after they are imported, and stop spending in
+   * the old system first, or their credits could be spent in both.
+   */
+  async importTenants(tenants: ImportTenant[], options: ImportOptions): Promise<ImportResult> {
+    const { importId } = options;
+    if (!importId || !/^[\x21-\x7e]{1,200}$/.test(importId)) {
+      throw new TypeError("importTenants: importId must be 1-200 visible ASCII characters");
+    }
+    const seen = new Set<string>();
+    for (const t of tenants) {
+      if (!t.tenantId) throw new TypeError("importTenants: every tenant needs a tenantId");
+      if (seen.has(t.tenantId)) throw new TypeError(`importTenants: tenant ${t.tenantId} appears twice`);
+      seen.add(t.tenantId);
+      if (!t.credits?.length && !t.purchases?.length) {
+        throw new TypeError(`importTenants: tenant ${t.tenantId} has neither credits nor purchases`);
+      }
+      // Checked up front so a bad row fails before anything is sent, not halfway.
+      for (const c of t.credits ?? []) {
+        if (!Number.isSafeInteger(c.amount) || c.amount <= 0) {
+          throw new TypeError(`importTenants: tenant ${t.tenantId} has a credit amount that is not a positive integer`);
+        }
+      }
+      const items = new Set<string>();
+      for (const p of t.purchases ?? []) {
+        if (!p.itemKey || !p.feature || !Number.isSafeInteger(p.credits) || p.credits <= 0) {
+          throw new TypeError(`importTenants: tenant ${t.tenantId} has a purchase without itemKey, feature or positive credits`);
+        }
+        const item = JSON.stringify([p.feature, p.itemKey]);
+        if (items.has(item)) throw new TypeError(`importTenants: tenant ${t.tenantId} has item ${p.itemKey} (${p.feature}) twice`);
+        items.add(item);
+      }
+    }
+
+    // Each tenant becomes one or more parts: part 0 carries its credits and
+    // first purchases, further parts the rest. Parts depend only on the
+    // tenant's own data, and part n is always sent under the same key, so a
+    // rerun with the same input replays instead of importing again.
+    const parts: Json[][] = [];
+    tenants.forEach((t) => {
+      const purchases = (t.purchases ?? []).map((p) => ({
+        item_key: p.itemKey,
+        feature: p.feature,
+        credits: p.credits,
+        purchased_at: toIso(p.purchasedAt),
+      }));
+      const chunks: (typeof purchases)[] = [];
+      for (let i = 0; i < purchases.length; i += IMPORT_PURCHASES_PER_CALL) {
+        chunks.push(purchases.slice(i, i + IMPORT_PURCHASES_PER_CALL));
+      }
+      const credits = (t.credits ?? []).map((c) => ({ amount: c.amount, expires_at: toIso(c.expiresAt), reason: c.reason }));
+      const count = Math.max(1, chunks.length);
+      for (let n = 0; n < count; n++) {
+        const entry: Json = { tenant_id: t.tenantId };
+        if (n === 0 && credits.length) entry.credits = credits.map(stripUndefined);
+        if (chunks[n]?.length) entry.purchases = chunks[n]!.map(stripUndefined);
+        (parts[n] ??= []).push(entry);
+      }
+    });
+
+    const results = new Map<string, ImportTenantResult>();
+    let done = 0;
+    for (const [n, entries] of parts.entries()) {
+      const key = n === 0 ? importId : `${importId}:part${n + 1}`;
+      // A tenant whose earlier part failed is not continued.
+      const pending = entries.filter((e) => results.get(str(e.tenant_id))?.status !== "failed");
+      for (const batch of batches(pending)) {
+        let list: Json[];
+        try {
+          const { body } = await this.#request("POST", "/v1/import", { tenants: batch }, key, options.signal, [], 300_000);
+          list = Array.isArray(body.results) ? body.results.filter(isRecord) : [];
+        } catch (error) {
+          if (options.signal?.aborted) throw error;
+          // Retries are already spent. Report this request's tenants as
+          // failed and carry on; a rerun with the same importId replays what
+          // went through and retries the rest.
+          const code = error instanceof TokenLedgerApiError ? error.code : "network_error";
+          const message = error instanceof Error ? error.message : String(error);
+          list = batch.map((e) => ({ tenant_id: e.tenant_id, status: "failed", error: code, message }));
+        }
+        for (const raw of list) mergeImportResult(results, raw);
+        if (n === 0) {
+          done += batch.length;
+          options.onProgress?.({ tenantsDone: done, tenantsTotal: tenants.length });
+        }
+      }
+    }
+
+    const ordered = tenants.map(
+      (t) =>
+        results.get(t.tenantId) ?? {
+          tenantId: t.tenantId,
+          status: "failed" as const,
+          grantedCredits: 0,
+          purchasesImported: 0,
+          purchasesSkipped: 0,
+          skippedItemKeys: [],
+          error: "no_result",
+          message: "the server returned no result for this tenant",
+        },
+    );
+    return {
+      imported: ordered.filter((r) => r.status === "imported").length,
+      replayed: ordered.filter((r) => r.status === "replayed").length,
+      failed: ordered.filter((r) => r.status === "failed").length,
+      tenants: ordered,
+    };
+  }
+
+  /** The account's settings (see `updateSettings`). */
+  async getSettings(options: Pick<RequestOptions, "signal"> = {}): Promise<AccountSettings> {
+    const { body } = await this.#request("GET", "/v1/settings", undefined, undefined, options.signal, []);
+    return toSettings(body);
+  }
+
+  /**
+   * Change the account's settings. `{ itemRetentionDays: 90 }` makes owned
+   * items expire 90 days after they were bought, so a tenant pays again for
+   * an item after that (for data that goes stale, say); `null` keeps them
+   * owned for good. Takes effect at once for every tenant of the account.
+   */
+  async updateSettings(settings: AccountSettings, options: Pick<RequestOptions, "signal"> = {}): Promise<AccountSettings> {
+    const days = settings.itemRetentionDays;
+    if (days !== null && (!Number.isSafeInteger(days) || days < 1)) {
+      throw new TypeError("updateSettings: itemRetentionDays must be a positive whole number of days, or null");
+    }
+    const { body } = await this.#request(
+      "PATCH",
+      "/v1/settings",
+      { item_retention_days: days },
+      undefined,
+      options.signal,
+      [],
+    );
+    return toSettings(body);
   }
 
   /**
@@ -580,18 +1033,64 @@ export class VaultClient {
     }
   }
 
+  /**
+   * Reserve for an item, waiting while another request is charging it. One
+   * idempotency key covers every attempt: `item_charge_in_progress` is not
+   * stored for replay, so each retry is decided afresh, and if a response is
+   * lost after the server made the hold, the retry gets that same hold back.
+   */
+  async #reserveItem(
+    options: ChargeOnceOptions,
+  ): Promise<{ alreadyCharged: boolean; reservationId: string | null; expiresAt: string }> {
+    const idempotencyKey = globalThis.crypto.randomUUID();
+    const deadline = Date.now() + (options.waitMs ?? 10_000);
+    const payload = {
+      tenant_id: options.tenantId,
+      feature: options.feature,
+      estimate_credits: options.credits,
+      ttl_seconds: options.ttlSeconds,
+      metadata: options.metadata ?? {},
+      item_key: options.itemKey,
+    };
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const { status, body } = await this.#post("/v1/credits/reserve", payload, { idempotencyKey }, [402]);
+        if (status === 402) throw new InsufficientCreditsError(body);
+        // A server without item charges would ignore item_key and charge
+        // every time; refuse rather than double-charge silently.
+        if (body.item_key !== options.itemKey || typeof body.already_charged !== "boolean") {
+          throw new TokenLedgerApiError(status, {
+            error: "item_charges_unsupported",
+            message: "the server did not confirm the item charge; it may predate chargeOnce",
+          });
+        }
+        return {
+          alreadyCharged: body.already_charged,
+          reservationId: typeof body.reservation_id === "string" ? body.reservation_id : null,
+          expiresAt: str(body.expires_at),
+        };
+      } catch (error) {
+        if (!(error instanceof TokenLedgerApiError) || error.code !== "item_charge_in_progress") throw error;
+        const wait = Math.min(250 * 2 ** attempt, 2_000, deadline - Date.now());
+        if (wait <= 0) throw error;
+        await this.#sleep(wait, undefined);
+      }
+    }
+  }
+
   #post(path: string, payload: Json, options: RequestOptions, accept: number[] = []): Promise<RawResponse> {
     const key = options.idempotencyKey ?? globalThis.crypto.randomUUID();
     return this.#request("POST", path, stripUndefined(payload), key, options.signal, accept);
   }
 
   async #request(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PATCH",
     path: string,
     payload: Json | undefined,
     idempotencyKey: string | undefined,
     signal: AbortSignal | undefined,
     accept: number[],
+    timeoutMs: number = this.#timeoutMs,
   ): Promise<RawResponse> {
     const headers: Record<string, string> = { accept: "application/json", ...this.#headers };
     if (payload !== undefined) headers["content-type"] = "application/json";
@@ -601,11 +1100,14 @@ export class VaultClient {
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       const timeout = new AbortController();
-      const timer = setTimeout(() => timeout.abort(new Error("request timed out")), this.#timeoutMs);
+      const timer = setTimeout(() => timeout.abort(new Error("request timed out")), Math.max(timeoutMs, this.#timeoutMs));
       const onAbort = () => timeout.abort(signal?.reason);
       signal?.addEventListener("abort", onAbort, { once: true });
 
+      // The timeout covers the whole exchange, reading the body included: a
+      // server that sends headers and then stalls must not hang the caller.
       let response: Response;
+      let text: string;
       try {
         response = await this.#fetch(`${this.#baseUrl}${path}`, {
           method,
@@ -613,27 +1115,28 @@ export class VaultClient {
           body,
           signal: timeout.signal,
         });
+        if (response.status >= 500 && attempt < this.#maxRetries) {
+          await response.body?.cancel();
+          await this.#backoff(attempt, signal);
+          continue;
+        }
+        text = await response.text();
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
+        // Safe to retry even if the server acted on it: the same
+        // Idempotency-Key replays the stored answer.
         if (attempt < this.#maxRetries) {
           await this.#backoff(attempt, signal);
           continue;
         }
-        throw new VaultNetworkError(`TokenLedger request failed: ${method} ${path}`, { cause: error });
+        throw new TokenLedgerNetworkError(`TokenLedger request failed: ${method} ${path}`, { cause: error });
       } finally {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
       }
 
-      if (response.status >= 500 && attempt < this.#maxRetries) {
-        await response.body?.cancel();
-        await this.#backoff(attempt, signal);
-        continue;
-      }
-
       const rateLimit = parseRateLimit(response.headers);
       this.#rateLimit = rateLimit;
-      const text = await response.text();
       let parsed: unknown = {};
       if (text) {
         try {
@@ -653,7 +1156,7 @@ export class VaultClient {
         continue;
       }
       if (response.status === 402) throw new InsufficientCreditsError(json);
-      throw new VaultApiError(response.status, json, retryAfter, rateLimit);
+      throw new TokenLedgerApiError(response.status, json, retryAfter, rateLimit);
     }
   }
 
@@ -696,6 +1199,74 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
 }
 
+function toSettings(body: Json): AccountSettings {
+  return { itemRetentionDays: typeof body.item_retention_days === "number" ? body.item_retention_days : null };
+}
+
+function toIso(value: Date | string | undefined): string | undefined {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+/** Pack import entries into requests of at most 100 tenants and 5 000 purchases. */
+function batches(entries: Json[]): Json[][] {
+  const out: Json[][] = [];
+  let current: Json[] = [];
+  let purchases = 0;
+  for (const entry of entries) {
+    const n = Array.isArray(entry.purchases) ? entry.purchases.length : 0;
+    if (current.length && (current.length >= IMPORT_TENANTS_PER_CALL || purchases + n > IMPORT_PURCHASES_PER_CALL)) {
+      out.push(current);
+      current = [];
+      purchases = 0;
+    }
+    current.push(entry);
+    purchases += n;
+  }
+  if (current.length) out.push(current);
+  return out;
+}
+
+/** Fold one part's server result into the tenant's overall result. */
+function mergeImportResult(results: Map<string, ImportTenantResult>, raw: Json): void {
+  const tenantId = str(raw.tenant_id);
+  const status = raw.status === "failed" ? "failed" : raw.status === "replayed" ? "replayed" : "imported";
+  const prev = results.get(tenantId);
+  const skipped = Array.isArray(raw.skipped_item_keys) ? raw.skipped_item_keys.map(str) : [];
+  const merged: ImportTenantResult = {
+    tenantId,
+    // Failed beats imported beats replayed: "replayed" only if every part was.
+    status:
+      prev?.status === "failed" || status === "failed"
+        ? "failed"
+        : prev?.status === "imported" || status === "imported"
+          ? "imported"
+          : "replayed",
+    grantedCredits: (prev?.grantedCredits ?? 0) + num(raw.granted_credits ?? 0),
+    purchasesImported: (prev?.purchasesImported ?? 0) + num(raw.purchases_imported ?? 0),
+    purchasesSkipped: (prev?.purchasesSkipped ?? 0) + num(raw.purchases_skipped ?? 0),
+    skippedItemKeys: [...(prev?.skippedItemKeys ?? []), ...skipped],
+  };
+  const available = typeof raw.available_credits === "number" ? raw.available_credits : prev?.availableCredits;
+  if (available !== undefined) merged.availableCredits = available;
+  const error = typeof raw.error === "string" ? raw.error : prev?.error;
+  if (error !== undefined) merged.error = error;
+  const message = typeof raw.message === "string" ? raw.message : prev?.message;
+  if (message !== undefined) merged.message = message;
+  results.set(tenantId, merged);
+}
+
+/** An AbortSignal that fires when a hold's TTL elapses. */
+function holdExpiry(reservationId: string, expiresAt: Date): { signal: AbortSignal; clear: () => void } {
+  const expiry = new AbortController();
+  // Not unref'd on purpose: it only lives while the callback runs, and a
+  // callback that is just waiting on the signal must still see the abort.
+  const timer = setTimeout(
+    () => expiry.abort(new Error(`credit hold ${reservationId} expired`)),
+    Math.max(0, expiresAt.getTime() - Date.now()),
+  );
+  return { signal: expiry.signal, clear: () => clearTimeout(timer) };
+}
+
 function errorReason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return `callback_failed: ${message}`.slice(0, 1_000);
@@ -713,6 +1284,10 @@ function toLedgerEntry(raw: Json): LedgerEntry {
     balanceAvailableAfter: num(raw.balance_available_after),
     balanceReservedAfter: num(raw.balance_reserved_after),
     metadata: isRecord(raw.metadata) ? raw.metadata : {},
+    feature: typeof raw.feature === "string" ? raw.feature : null,
+    buckets: (Array.isArray(raw.buckets) ? raw.buckets : [])
+      .filter(isRecord)
+      .map((b) => ({ bucketId: str(b.bucket_id), amount: num(b.amount) })),
     createdAt: str(raw.created_at),
   };
 }
@@ -727,3 +1302,22 @@ function toCreditBucket(raw: Json): CreditBucket {
     createdAt: str(raw.created_at),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Old names, kept so existing code keeps working
+// ---------------------------------------------------------------------------
+
+/** @deprecated Renamed to `TokenLedgerClient`. */
+export const VaultClient = TokenLedgerClient;
+/** @deprecated Renamed to `TokenLedgerClient`. */
+export type VaultClient = TokenLedgerClient;
+/** @deprecated Renamed to `TokenLedgerClientOptions`. */
+export type VaultClientOptions = TokenLedgerClientOptions;
+/** @deprecated Renamed to `TokenLedgerApiError`. */
+export const VaultApiError = TokenLedgerApiError;
+/** @deprecated Renamed to `TokenLedgerApiError`. */
+export type VaultApiError = TokenLedgerApiError;
+/** @deprecated Renamed to `TokenLedgerNetworkError`. */
+export const VaultNetworkError = TokenLedgerNetworkError;
+/** @deprecated Renamed to `TokenLedgerNetworkError`. */
+export type VaultNetworkError = TokenLedgerNetworkError;
