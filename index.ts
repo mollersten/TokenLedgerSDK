@@ -32,9 +32,15 @@ export type ReservationStatus = "PENDING" | "COMMITTED" | "RELEASED" | "EXPIRED"
 // Options & params
 // ---------------------------------------------------------------------------
 
+/** The hosted TokenLedger API, used when `baseUrl` is not given. */
+export const DEFAULT_BASE_URL = "https://tokenledger-api.fly.dev";
+
 export interface TokenLedgerClientOptions {
-  /** API base URL, e.g. `https://api.tokenledger.example`. */
-  baseUrl: string;
+  /**
+   * API base URL. Defaults to {@link DEFAULT_BASE_URL}, the hosted API. Set
+   * it to reach another server, e.g. `http://127.0.0.1:8080` for a local one.
+   */
+  baseUrl?: string;
   /** Secret API key (`tl_live_…`). Keep it server-side; never ship it to browsers. */
   apiKey: string;
   /** Extra headers sent with every request. */
@@ -534,13 +540,16 @@ export class TokenLedgerClient {
   #rateLimit: RateLimitInfo | undefined;
 
   constructor(options: TokenLedgerClientOptions) {
-    if (!options.baseUrl) throw new TypeError("TokenLedgerClient: baseUrl is required");
+    // An empty string is a mistake (say, an unset env var), not a request for
+    // the default: refuse it rather than quietly reach the hosted API.
+    const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+    if (!baseUrl) throw new TypeError("TokenLedgerClient: baseUrl is empty; omit it to use the hosted API");
     if (!options.apiKey) throw new TypeError("TokenLedgerClient: apiKey is required");
     const fetchImpl = options.fetch ?? globalThis.fetch;
     if (typeof fetchImpl !== "function") {
       throw new TypeError("TokenLedgerClient: no fetch implementation available; pass options.fetch");
     }
-    this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.#baseUrl = baseUrl.replace(/\/+$/, "");
     this.#headers = { ...options.headers, authorization: `Bearer ${options.apiKey}` };
     this.#fetch = fetchImpl;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
