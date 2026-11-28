@@ -1,7 +1,17 @@
 {
-  "name": "@tokenledger/sdk",
-  "version": "0.1.0",
+  "name": "tokenledger-sdk",
+  "version": "0.2.0",
   "description": "Zero-dependency TypeScript client for the TokenLedger credit ledger API",
+  "keywords": ["tokenledger", "credits", "usage-based-billing", "metering", "ledger", "entitlements"],
+  "license": "MIT",
+  "homepage": "https://github.com/mollersten/TokenLedgerSDK#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mollersten/TokenLedgerSDK.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mollersten/TokenLedgerSDK/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,11 +22,19 @@
     }
   },
   "files": ["dist"],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
   },
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

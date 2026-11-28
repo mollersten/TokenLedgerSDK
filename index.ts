@@ -1,6 +1,15 @@
 /**
  * TokenLedger TypeScript SDK.
  *
+ * Most apps need only these, one call each:
+ *
+ *   addCredits(tenantId, credits)                     → new balance
+ *   charge(tenantId, credits)                         → new balance
+ *   getBalance(tenantId)                              → balance
+ *   meter(tenantId, maxCredits, work)                 → what `work` returns
+ *   chargeOnce(tenantId, itemKey, credits, produce)   → what `produce` returns
+ *   importCustomers(customers)                        → { imported, failed, … }
+ *
  * Zero runtime dependencies: uses the platform's `fetch`, `AbortController`
  * and `crypto.randomUUID` (Node 20+, Deno, Bun, modern browsers).
  *
@@ -34,6 +43,13 @@ export type ReservationStatus = "PENDING" | "COMMITTED" | "RELEASED" | "EXPIRED"
 
 /** The hosted TokenLedger API, used when `baseUrl` is not given. */
 export const DEFAULT_BASE_URL = "https://tokenledger-api.fly.dev";
+
+/**
+ * The feature used when a call doesn't name one. Features label what a charge
+ * was for; for `chargeOnce` the feature is also part of the item, so imported
+ * purchases and charges that both leave it out match up.
+ */
+export const DEFAULT_FEATURE = "default";
 
 export interface TokenLedgerClientOptions {
   /**
@@ -83,7 +99,8 @@ export interface GrantParams {
 
 export interface ReserveParams {
   tenantId: string;
-  feature: string;
+  /** What the hold is for, e.g. `"report"`. Default {@link DEFAULT_FEATURE}. */
+  feature?: string;
   estimateCredits: number;
   /** How long the hold lives before the server's reaper returns it. Default 60. */
   ttlSeconds?: number;
@@ -268,7 +285,8 @@ export interface ChargeOnceOptions {
    * again (`report:${id}:v2`).
    */
   itemKey: string;
-  feature: string;
+  /** Default {@link DEFAULT_FEATURE}. Part of the item (see `itemKey`). */
+  feature?: string;
   /** What the item costs. Charged in full once it is delivered. */
   credits: number;
   /**
@@ -350,11 +368,11 @@ export interface ImportCredit {
 export interface ImportPurchase {
   itemKey: string;
   /**
-   * The feature `chargeOnce` will use for this item. It is part of the item:
-   * under a different feature the same key is a different item, not covered
-   * by this purchase.
+   * The feature `chargeOnce` will use for this item (default
+   * {@link DEFAULT_FEATURE}). It is part of the item: under a different
+   * feature the same key is a different item, not covered by this purchase.
    */
-  feature: string;
+  feature?: string;
   /** What they paid for it (at least 1). */
   credits: number;
   purchasedAt?: Date | string;
@@ -520,6 +538,97 @@ export class TokenLedgerNetworkError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// The simple functions: options and results
+// ---------------------------------------------------------------------------
+
+/** Makes `chargeOnce`'s item (see `ChargeOnceOptions`). */
+export type ChargeOnceCallback<T> = (item: ChargeOnceItem) => Promise<T | NoCharge<T>> | T | NoCharge<T>;
+
+export interface AddCreditsOptions {
+  /** Make these credits expire then, e.g. at the end of a monthly allowance. */
+  expiresAt?: Date | string;
+  reason?: string;
+  metadata?: Metadata;
+  /**
+   * Makes the call safe to repeat, even from another process: the same key
+   * adds the credits once. Use something that names the top-up, such as an
+   * invoice id.
+   */
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+}
+
+export interface ChargeOptions {
+  /** What the charge is for, e.g. `"report"`. Default {@link DEFAULT_FEATURE}. */
+  feature?: string;
+  metadata?: Metadata;
+  /** Makes the call safe to repeat, e.g. an order id: the same key charges once. */
+  idempotencyKey?: string;
+}
+
+export interface MeterOptions {
+  /** What the work is, e.g. `"report"`. Default {@link DEFAULT_FEATURE}. */
+  feature?: string;
+  /**
+   * How long the work may take. Default 60. If it takes longer, nothing is
+   * charged and `meter` throws, so set this above your slowest run.
+   */
+  ttlSeconds?: number;
+  metadata?: Metadata;
+  idempotencyKey?: string;
+}
+
+export interface SimpleChargeOnceOptions {
+  /** Default {@link DEFAULT_FEATURE}. Part of the item: see `ChargeOnceOptions.itemKey`. */
+  feature?: string;
+  /** How long `produce` may take. Default 60. */
+  ttlSeconds?: number;
+  metadata?: Metadata;
+  /** How long to wait while another request charges the same item. Default 10 000 ms. */
+  waitMs?: number;
+  releaseReason?: string;
+}
+
+/** One customer for `importCustomers`. */
+export interface ImportCustomer {
+  /** Your id for the customer: the `tenantId` you use in every other call. */
+  id: string;
+  /** Their balance in the old system. Imported once; later runs don't change it. */
+  credits?: number;
+  /**
+   * Items they already bought, so `chargeOnce` won't charge them again. A
+   * string is an item key under the default feature; use the object form
+   * if you pass a `feature` to `chargeOnce`.
+   */
+  owns?: (string | { itemKey: string; feature?: string; credits?: number; purchasedAt?: Date | string })[];
+}
+
+export interface ImportCustomersOptions {
+  /**
+   * Leave it out: the default is the same on every run, so running an import
+   * again only adds what's new. Set your own only to import different data
+   * for customers imported in the last 24 hours.
+   */
+  importId?: string;
+  onProgress?: (progress: { tenantsDone: number; tenantsTotal: number }) => void;
+  signal?: AbortSignal;
+}
+
+export interface ImportCustomersResult {
+  /** Customers imported by this call. */
+  imported: number;
+  /** Customers an earlier run already imported (nothing changed for them). */
+  alreadyImported: number;
+  /** Customers with no credits and nothing owned: nothing to send. */
+  skipped: number;
+  /** Customers that could not be imported, and why. Fix them and run again. */
+  failed: { id: string; error: string; message: string }[];
+}
+
+/** The `importId` `importCustomers` uses unless given one. */
+const DEFAULT_IMPORT_ID = "tokenledger-sdk-import";
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -556,6 +665,166 @@ export class TokenLedgerClient {
     this.#maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.#retryDelayMs = options.retryDelayMs ?? 200;
   }
+
+  // -------------------------------------------------------------------------
+  // The simple functions: one call each, and you get back what you need.
+  // Everything below them is the full API, for more control.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Give a customer credits. Returns their new balance.
+   *
+   * @example
+   * await ledger.addCredits("cus_123", 1000); // → 1000
+   */
+  async addCredits(tenantId: string, credits: number, options: AddCreditsOptions = {}): Promise<number> {
+    if (!Number.isSafeInteger(credits) || credits <= 0) {
+      throw new TypeError(`addCredits: credits must be a positive whole number, got ${String(credits)}`);
+    }
+    const { idempotencyKey, signal, ...grant } = options;
+    const result = await this.grant({ tenantId, amount: credits, ...grant }, { idempotencyKey, signal });
+    return result.availableCredits;
+  }
+
+  /**
+   * Take credits from a customer's balance. Returns their new balance.
+   *
+   * @example
+   * await ledger.charge("cus_123", 5); // → 995
+   * @throws InsufficientCreditsError when the balance is too low; nothing is charged.
+   */
+  async charge(tenantId: string, credits: number, options: ChargeOptions = {}): Promise<number> {
+    if (!Number.isSafeInteger(credits) || credits <= 0) {
+      throw new TypeError(`charge: credits must be a positive whole number, got ${String(credits)}`);
+    }
+    const { feature, metadata, idempotencyKey } = options;
+    const hold = await this.reserve(
+      { tenantId, feature, estimateCredits: credits },
+      { idempotencyKey: idempotencyKey === undefined ? undefined : `${idempotencyKey}:reserve` },
+    );
+    if (!hold.allowed) throw insufficientCredits(hold);
+    const commit = await this.commit(
+      { tenantId, reservationId: hold.reservationId, actualCreditsUsed: credits, metadata },
+      { idempotencyKey: `${hold.reservationId}:commit` },
+    );
+    return commit.availableCredits;
+  }
+
+  /**
+   * A customer's spendable credits: 0 for a customer who has never been given
+   * any.
+   *
+   * @example
+   * await ledger.getBalance("cus_123"); // → 995
+   */
+  async getBalance(tenantId: string, options: Pick<RequestOptions, "signal"> = {}): Promise<number> {
+    try {
+      return (await this.getWallet(tenantId, options)).availableCredits;
+    } catch (error) {
+      if (error instanceof TokenLedgerApiError && error.code === "wallet_not_found") return 0;
+      throw error;
+    }
+  }
+
+  /**
+   * Run work whose cost you only know afterwards, and charge what it used.
+   * `maxCredits` is held while it runs, so the customer can't overspend.
+   * Report usage with `use(credits)`; calls add up. If `work` never calls
+   * `use`, the full `maxCredits` is charged. If `work` throws, nothing is
+   * charged and the error is rethrown. Returns what `work` returns.
+   *
+   * Usage above `maxCredits` is taken from the balance when it can cover it.
+   *
+   * @example
+   * const report = await ledger.meter("cus_123", 50, async (use) => {
+   *   const r = await generateReport();
+   *   use(r.creditsUsed);
+   *   return r;
+   * });
+   * @throws InsufficientCreditsError when the customer can't cover `maxCredits`; `work` doesn't run.
+   */
+  async meter<T>(
+    tenantId: string,
+    maxCredits: number,
+    work: (use: (credits: number) => void, hold: CreditHold) => Promise<T> | T,
+    options: MeterOptions = {},
+  ): Promise<T> {
+    if (!Number.isSafeInteger(maxCredits) || maxCredits <= 0) {
+      throw new TypeError(`meter: maxCredits must be a positive whole number, got ${String(maxCredits)}`);
+    }
+    let used: number | undefined;
+    const use = (credits: number): void => {
+      if (!Number.isSafeInteger(credits) || credits < 0) {
+        throw new TypeError(`meter: use() takes a whole number of credits, 0 or more, got ${String(credits)}`);
+      }
+      used = (used ?? 0) + credits;
+    };
+    const { feature, ttlSeconds, metadata, idempotencyKey } = options;
+    const { result } = await this.withCreditHold<T>(
+      { tenantId, feature, estimateCredits: maxCredits, ttlSeconds, metadata, idempotencyKey },
+      async (hold) => {
+        const result = await work(use, hold);
+        return { cost: used ?? maxCredits, result };
+      },
+    );
+    return result as T;
+  }
+
+  /**
+   * Move customers over from another billing system: their balance, and what
+   * they already bought so `chargeOnce` doesn't charge for it again.
+   * Optional: nothing else needs it. Pass any number of customers. It's safe
+   * to run again: customers already imported are never added twice.
+   *
+   * @example
+   * const { imported, failed } = await ledger.importCustomers([
+   *   { id: "cus_123", credits: 520, owns: ["email:p_981"] },
+   *   { id: "cus_456", credits: 100 },
+   * ]);
+   */
+  async importCustomers(
+    customers: ImportCustomer[],
+    options: ImportCustomersOptions = {},
+  ): Promise<ImportCustomersResult> {
+    const tenants: ImportTenant[] = [];
+    for (const customer of customers) {
+      const { id, credits } = customer;
+      if (credits !== undefined && (!Number.isSafeInteger(credits) || credits < 0)) {
+        throw new TypeError(`importCustomers: customer ${id} has credits that are not a whole number, 0 or more`);
+      }
+      const purchases: ImportPurchase[] = (customer.owns ?? []).map((item) =>
+        typeof item === "string"
+          ? { itemKey: item, credits: 1 }
+          : { itemKey: item.itemKey, feature: item.feature, credits: item.credits ?? 1, purchasedAt: item.purchasedAt },
+      );
+      if (!credits && purchases.length === 0) continue; // nothing to import
+      tenants.push({
+        tenantId: id,
+        ...(credits ? { credits: [{ amount: credits }] } : {}),
+        ...(purchases.length ? { purchases } : {}),
+      });
+    }
+    const skipped = customers.length - tenants.length;
+    if (tenants.length === 0) return { imported: 0, alreadyImported: 0, skipped, failed: [] };
+
+    const report = await this.importTenants(tenants, {
+      importId: options.importId ?? DEFAULT_IMPORT_ID,
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    return {
+      imported: report.imported,
+      alreadyImported: report.replayed,
+      skipped,
+      failed: report.tenants
+        .filter((t) => t.status === "failed")
+        .map((t) => ({ id: t.tenantId, error: t.error ?? "unknown_error", message: t.message ?? "" })),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // The full API
+  // -------------------------------------------------------------------------
 
   /**
    * Add credits to a tenant's wallet (creates the wallet if needed). Pass
@@ -594,7 +863,7 @@ export class TokenLedgerClient {
       "/v1/credits/reserve",
       {
         tenant_id: params.tenantId,
-        feature: params.feature,
+        feature: params.feature ?? DEFAULT_FEATURE,
         estimate_credits: params.estimateCredits,
         ttl_seconds: params.ttlSeconds,
         metadata: params.metadata ?? {},
@@ -714,14 +983,7 @@ export class TokenLedgerClient {
     const reservation = await this.reserve(reserveParams, {
       idempotencyKey: idempotencyKey ? `${idempotencyKey}:reserve` : undefined,
     });
-    if (!reservation.allowed) {
-      throw new InsufficientCreditsError({
-        error: reservation.error,
-        message: `tenant has ${reservation.availableCredits} credits, ${reservation.requestedCredits} requested`,
-        available_credits: reservation.availableCredits,
-        requested_credits: reservation.requestedCredits,
-      });
-    }
+    if (!reservation.allowed) throw insufficientCredits(reservation);
 
     const { reservationId } = reservation;
     const expiresAt = new Date(reservation.expiresAt);
@@ -732,7 +994,7 @@ export class TokenLedgerClient {
       outcome = await callback({
         reservationId,
         tenantId: options.tenantId,
-        feature: options.feature,
+        feature: options.feature ?? DEFAULT_FEATURE,
         estimateCredits: options.estimateCredits,
         expiresAt,
         signal: expiry.signal,
@@ -811,15 +1073,48 @@ export class TokenLedgerClient {
    *
    * @throws InsufficientCreditsError when the tenant cannot cover `credits`.
    */
+  chargeOnce<T>(options: ChargeOnceOptions, callback: ChargeOnceCallback<T>): Promise<ChargeOnceResult<T>>;
+  /**
+   * Charge a tenant `credits` for an item the first time they get it; every
+   * time after that it's free. `produce` makes the item; you get back what it
+   * returns. Return `noCharge(value)` from it to deliver without billing.
+   *
+   * @example
+   * const email = await ledger.chargeOnce("cus_123", `email:${personId}`, 1, () => lookUpEmail(personId));
+   * @throws InsufficientCreditsError when the tenant cannot pay for it.
+   */
+  chargeOnce<T>(
+    tenantId: string,
+    itemKey: string,
+    credits: number,
+    produce: ChargeOnceCallback<T>,
+    options?: SimpleChargeOnceOptions,
+  ): Promise<T>;
   async chargeOnce<T>(
-    options: ChargeOnceOptions,
-    callback: (item: ChargeOnceItem) => Promise<T | NoCharge<T>> | T | NoCharge<T>,
-  ): Promise<ChargeOnceResult<T>> {
-    const { tenantId, itemKey, feature, credits } = options;
+    first: string | ChargeOnceOptions,
+    second: string | ChargeOnceCallback<T>,
+    credits?: number,
+    produce?: ChargeOnceCallback<T>,
+    options: SimpleChargeOnceOptions = {},
+  ): Promise<T | ChargeOnceResult<T>> {
+    if (typeof first === "string") {
+      if (typeof second !== "string" || typeof credits !== "number" || typeof produce !== "function") {
+        throw new TypeError("chargeOnce: call it as chargeOnce(tenantId, itemKey, credits, produce)");
+      }
+      const { result } = await this.#chargeOnce({ ...options, tenantId: first, itemKey: second, credits }, produce);
+      return result;
+    }
+    if (typeof second !== "function") throw new TypeError("chargeOnce: the second argument must be a function");
+    return this.#chargeOnce(first, second);
+  }
+
+  async #chargeOnce<T>(options: ChargeOnceOptions, callback: ChargeOnceCallback<T>): Promise<ChargeOnceResult<T>> {
+    const { tenantId, itemKey, credits } = options;
+    const feature = options.feature ?? DEFAULT_FEATURE;
     if (!Number.isSafeInteger(credits) || credits <= 0) {
       throw new TypeError(`chargeOnce: credits must be a positive integer, got ${String(credits)}`);
     }
-    const reservation = await this.#reserveItem(options);
+    const reservation = await this.#reserveItem({ ...options, feature });
     const { reservationId } = reservation;
 
     if (reservation.alreadyCharged) {
@@ -905,11 +1200,12 @@ export class TokenLedgerClient {
       }
       const items = new Set<string>();
       for (const p of t.purchases ?? []) {
-        if (!p.itemKey || !p.feature || !Number.isSafeInteger(p.credits) || p.credits <= 0) {
-          throw new TypeError(`importTenants: tenant ${t.tenantId} has a purchase without itemKey, feature or positive credits`);
+        if (!p.itemKey || p.feature === "" || !Number.isSafeInteger(p.credits) || p.credits <= 0) {
+          throw new TypeError(`importTenants: tenant ${t.tenantId} has a purchase without itemKey or positive credits, or with an empty feature`);
         }
-        const item = JSON.stringify([p.feature, p.itemKey]);
-        if (items.has(item)) throw new TypeError(`importTenants: tenant ${t.tenantId} has item ${p.itemKey} (${p.feature}) twice`);
+        const feature = p.feature ?? DEFAULT_FEATURE;
+        const item = JSON.stringify([feature, p.itemKey]);
+        if (items.has(item)) throw new TypeError(`importTenants: tenant ${t.tenantId} has item ${p.itemKey} (${feature}) twice`);
         items.add(item);
       }
     }
@@ -922,7 +1218,7 @@ export class TokenLedgerClient {
     tenants.forEach((t) => {
       const purchases = (t.purchases ?? []).map((p) => ({
         item_key: p.itemKey,
-        feature: p.feature,
+        feature: p.feature ?? DEFAULT_FEATURE,
         credits: p.credits,
         purchased_at: toIso(p.purchasedAt),
       }));
@@ -1055,7 +1351,7 @@ export class TokenLedgerClient {
     const deadline = Date.now() + (options.waitMs ?? 10_000);
     const payload = {
       tenant_id: options.tenantId,
-      feature: options.feature,
+      feature: options.feature ?? DEFAULT_FEATURE,
       estimate_credits: options.credits,
       ttl_seconds: options.ttlSeconds,
       metadata: options.metadata ?? {},
@@ -1191,6 +1487,15 @@ export class TokenLedgerClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function insufficientCredits(denied: ReserveDenied): InsufficientCreditsError {
+  return new InsufficientCreditsError({
+    error: denied.error,
+    message: `tenant has ${denied.availableCredits} credits, ${denied.requestedCredits} requested`,
+    available_credits: denied.availableCredits,
+    requested_credits: denied.requestedCredits,
+  });
+}
 
 function isRecord(value: unknown): value is Json {
   return typeof value === "object" && value !== null && !Array.isArray(value);
